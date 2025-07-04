@@ -2,6 +2,10 @@ const { Telegraf } = require('telegraf');
 const { TwitterApi } = require('twitter-api-v2');
 const express = require('express');
 
+// Rate limiting configuration
+const RATE_LIMIT_MINUTES = process.env.RATE_LIMIT_MINUTES || 5; // Default: 1 tweet per 5 minutes
+const lastTweetTime = { timestamp: 0 };
+
 // Initialize Express app for health checks
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -53,10 +57,27 @@ async function processMessage(ctx) {
     const message = ctx.message || ctx.channelPost;
     if (!message) return;
 
+    // Check if Twitter is disabled
+    if (process.env.TWITTER_DISABLED === 'true') {
+      console.log('Twitter posting is disabled');
+      return;
+    }
+
     // Check if message is from monitored channel
     const chatId = message.chat.id.toString();
     if (!MONITORED_CHANNELS.includes(chatId)) {
       console.log(`Message from unmonitored channel: ${chatId}`);
+      return;
+    }
+
+    // Rate limiting check
+    const now = Date.now();
+    const timeSinceLastTweet = now - lastTweetTime.timestamp;
+    const minIntervalMs = RATE_LIMIT_MINUTES * 60 * 1000;
+    
+    if (timeSinceLastTweet < minIntervalMs) {
+      const remainingMinutes = Math.ceil((minIntervalMs - timeSinceLastTweet) / 60000);
+      console.log(`Rate limit: Skipping message. Next tweet allowed in ${remainingMinutes} minutes`);
       return;
     }
 
@@ -72,17 +93,25 @@ async function processMessage(ctx) {
 
     // Handle different message types
     if (message.photo && message.photo.length > 0) {
-      // Get the highest resolution photo
-      const photo = message.photo[message.photo.length - 1];
-      const photoBuffer = await downloadTelegramFile(ctx, photo.file_id);
-      const mediaId = await uploadMediaToTwitter(photoBuffer, 'image/jpeg');
-      if (mediaId) mediaIds.push(mediaId);
+      try {
+        // Get the highest resolution photo
+        const photo = message.photo[message.photo.length - 1];
+        const photoBuffer = await downloadTelegramFile(ctx, photo.file_id);
+        const mediaId = await uploadMediaToTwitter(photoBuffer, 'image/jpeg');
+        if (mediaId) mediaIds.push(mediaId);
+      } catch (error) {
+        console.log('Failed to process photo, posting text only:', error.message);
+      }
     }
 
     if (message.video) {
-      const videoBuffer = await downloadTelegramFile(ctx, message.video.file_id);
-      const mediaId = await uploadMediaToTwitter(videoBuffer, 'video/mp4');
-      if (mediaId) mediaIds.push(mediaId);
+      try {
+        const videoBuffer = await downloadTelegramFile(ctx, message.video.file_id);
+        const mediaId = await uploadMediaToTwitter(videoBuffer, 'video/mp4');
+        if (mediaId) mediaIds.push(mediaId);
+      } catch (error) {
+        console.log('Failed to process video, posting text only:', error.message);
+      }
     }
 
     if (message.document) {
@@ -111,7 +140,12 @@ async function processMessage(ctx) {
     }
 
     const tweet = await rwClient.v2.tweet(tweetOptions);
+    
+    // Update last tweet timestamp
+    lastTweetTime.timestamp = Date.now();
+    
     console.log('Tweet posted successfully:', tweet.data.id);
+    console.log(`Next tweet allowed in ${RATE_LIMIT_MINUTES} minutes`);
 
   } catch (error) {
     console.error('Error processing message:', error);
@@ -130,12 +164,13 @@ async function processMessage(ctx) {
   }
 }
 
-// Download file from Telegram
+// Download file from Telegram - FIXED VERSION
 async function downloadTelegramFile(ctx, fileId) {
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
     const response = await fetch(fileLink.href);
-    return await response.buffer();
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
   } catch (error) {
     console.error('Error downloading Telegram file:', error);
     throw error;
@@ -183,8 +218,21 @@ async function startBot() {
     const me = await rwClient.v2.me();
     console.log('Twitter connection successful. Authenticated as:', me.data.username);
 
-    // Start the bot
-    await bot.launch();
+    // Clear any existing webhooks first
+    try {
+      await bot.telegram.deleteWebhook();
+      console.log('Cleared existing webhooks');
+    } catch (error) {
+      console.log('No existing webhooks to clear');
+    }
+
+    // Add a small delay to ensure clean connection
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Start the bot with error handling
+    await bot.launch({
+      dropPendingUpdates: true // This clears old pending messages
+    });
     console.log('Telegram bot started successfully');
 
     // Start Express server
@@ -195,7 +243,16 @@ async function startBot() {
     console.log('Bot is running and ready to forward messages from Telegram to Twitter');
   } catch (error) {
     console.error('Failed to start bot:', error);
-    process.exit(1);
+    
+    // If it's a 409 error, wait and retry
+    if (error.response && error.response.error_code === 409) {
+      console.log('Conflict detected, waiting 10 seconds and retrying...');
+      setTimeout(() => {
+        process.exit(1); // This will trigger a restart
+      }, 10000);
+    } else {
+      process.exit(1);
+    }
   }
 }
 
